@@ -1,7 +1,9 @@
 import streamlit as st
 import google.generativeai as genai
-import fitz  # PyMuPDF (Công nghệ chụp ảnh file)
+import fitz  # PyMuPDF
 import time
+import zipfile
+import io
 
 # --- CẤU HÌNH GIAO DIỆN DOANH NGHIỆP ---
 st.set_page_config(
@@ -11,14 +13,12 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# --- CSS CHO GIAO DIỆN VĂN PHÒNG ---
+# --- CSS CHO GIAO DIỆN ---
 st.markdown("""
 <style>
-    /* Font chữ nghiêm túc */
-    body {font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;}
-    h1 {color: #003366;} /* Màu xanh doanh nghiệp */
+    body {font-family: 'Segoe UI', sans-serif;}
+    h1 {color: #003366;}
     
-    /* Card kết quả */
     .result-card {
         background-color: #ffffff; 
         padding: 15px; 
@@ -36,11 +36,16 @@ st.markdown("""
         border-radius: 4px; 
         height: 3em;
     }
+    /* Chỉnh màu nút tải ZIP cho nổi bật */
+    .download-btn {
+        background-color: #28a745 !important;
+        color: white !important;
+    }
     #MainMenu {visibility: hidden;} footer {visibility: hidden;}
 </style>
 """, unsafe_allow_html=True)
 
-# --- LOGIC XỬ LÝ (GIỮ NGUYÊN CÔNG NGHỆ TỐT NHẤT) ---
+# --- LOGIC XỬ LÝ ---
 def get_best_model(api_key):
     genai.configure(api_key=api_key)
     try:
@@ -68,32 +73,22 @@ def process_company_rule(uploaded_file, api_key, model_name, status_container):
         
         uploaded_file.seek(0)
         img_data = pdf_page_to_image(uploaded_file)
-        if img_data is None: return "ERROR", "File lỗi hoặc bị khóa."
+        if img_data is None: return "ERROR", "File lỗi."
 
         image_part = {"mime_type": "image/png", "data": img_data}
         
-        # --- PROMPT THEO QUY TẮC CÔNG TY (YY.MM.DD) ---
         prompt = """
-        Bạn là nhân viên văn thư chuyên nghiệp. Hãy đặt tên file theo QUY CHUẨN CÔNG TY.
-        
-        1. CẤU TRÚC: 
-           YY.MM.DD_LOAI_SoHieu_NoiDung_TrangThai.pdf
-        
-        2. QUY ĐỊNH CHI TIẾT:
-           - YY.MM.DD: Năm (2 số cuối).Tháng.Ngày (Ví dụ: 25.12.31). Dùng dấu chấm ngăn cách.
+        Đặt tên file PDF theo QUY CHUẨN CÔNG TY.
+        1. CẤU TRÚC: YY.MM.DD_LOAI_SoHieu_NoiDung_TrangThai.pdf
+        2. QUY ĐỊNH:
+           - YY.MM.DD: Năm (2 số cuối).Tháng.Ngày (Ví dụ: 25.12.31).
            - LOAI: Viết tắt in hoa (QD, TTr, CV, TB, GP, HD, BB, BC...).
-           - SoHieu: Số hiệu văn bản. (Ví dụ: 125-UBND). Thay dấu gạch chéo '/' bằng gạch ngang '-'.
+           - SoHieu: Số hiệu (Ví dụ: 125-UBND, thay / bằng -).
            - NoiDung: Tiếng Việt không dấu, ngắn gọn, nối bằng gạch dưới '_'.
-           - TrangThai: Mặc định là 'Signed' (Đã ký). Nếu là bản thảo thì 'v01'.
-        
-        3. VÍ DỤ MẪU:
-           - Input: Quyết định 125/UBND ngày 15/08/2025.
-           - Output: 25.08.15_QD_125-UBND_Giao_dat_Dot1_Signed.pdf
-           
-        YÊU CẦU: Chỉ trả về duy nhất tên file kết quả.
+           - TrangThai: Mặc định 'Signed'.
+        Chỉ trả về tên file.
         """
         
-        # Cơ chế thử lại (Anti-429)
         max_retries = 5
         wait_time = 65
         
@@ -103,38 +98,32 @@ def process_company_rule(uploaded_file, api_key, model_name, status_container):
                 new_name = result.text.strip().replace("`", "")
                 if not new_name.lower().endswith(".pdf"): new_name += ".pdf"
                 return new_name, None
-                
             except Exception as e:
                 if "429" in str(e) or "Quota" in str(e) or "400" in str(e):
                     if attempt < max_retries - 1:
                         with status_container:
                             for s in range(wait_time, 0, -1):
-                                st.warning(f"⏳ Hệ thống đang bận. Vui lòng chờ {s}s... (Lần {attempt+1})")
+                                st.warning(f"⏳ Hệ thống đang bận. Chờ {s}s... (Lần {attempt+1})")
                                 time.sleep(1)
                             st.info("🔄 Đang xử lý lại...")
                             continue
                     else:
-                        return None, "Server quá tải, vui lòng thử lại sau."
+                        return None, "Server quá tải."
                 else:
                     return None, str(e)
-                    
     except Exception as e:
         return None, str(e)
 
-# --- GIAO DIỆN NGƯỜI DÙNG ---
+# --- GIAO DIỆN ---
 with st.sidebar:
     st.title("⚙️ CẤU HÌNH")
     st.markdown("---")
-    
     with st.expander("🔑 Google API Key", expanded=True):
         api_key = st.text_input("Nhập Key:", type="password")
-    
-    st.info("ℹ️ Quy tắc: `YY.MM.DD`\n\nVí dụ: `25.12.31_QD...`")
-    st.markdown("---")
-    st.caption("© Internal System - For Company Use Only")
+    st.info("ℹ️ Quy tắc: `YY.MM.DD`")
+    st.caption("© Internal System")
 
-# --- PHẦN CHÍNH ---
-st.title("🏢 HỆ THỐNG SỐ HÓA TÀI LIỆU DOANH NGHIỆP")
+st.title("🏢 HỆ THỐNG SỐ HÓA TÀI LIỆU")
 st.markdown("##### Tiêu chuẩn: `YY.MM.DD_LOAI_SoHieu_NoiDung_Signed.pdf`")
 
 uploaded_files = st.file_uploader("Tải tập tin lên (PDF)", type=['pdf'], accept_multiple_files=True)
@@ -149,38 +138,67 @@ if uploaded_files:
                 st.error("❌ Key không hợp lệ.")
                 st.stop()
             
-            st.success(f"✅ Kết nối thành công. Đang xử lý hồ sơ...")
+            st.success(f"✅ Kết nối thành công. Đang xử lý...")
             progress_bar = st.progress(0)
+            
+            # Danh sách chứa các file thành công để nén ZIP
+            success_files = []
             
             for i, uploaded_file in enumerate(uploaded_files):
                 with st.container():
                     status_box = st.empty()
-                    # Gọi hàm xử lý công ty
                     new_name, error_msg = process_company_rule(uploaded_file, api_key, active_model, status_box)
                     
                     if error_msg:
                         st.error(f"❌ {uploaded_file.name}: {error_msg}")
                     else:
                         status_box.empty()
+                        
+                        # Lưu file vào danh sách để tý nữa nén ZIP
+                        uploaded_file.seek(0)
+                        file_data = uploaded_file.read()
+                        success_files.append((new_name, file_data))
+                        
+                        # Hiển thị thẻ kết quả (Vẫn giữ nút tải lẻ nếu cần gấp)
                         col_info, col_dl = st.columns([3, 1])
                         with col_info:
                             st.markdown(f"""
                             <div class="result-card">
-                                <b>📄 Tên gốc:</b> {uploaded_file.name}<br>
-                                <b style="color: #0056b3;">✅ Tên chuẩn:</b> {new_name}
+                                <b>📄 Gốc:</b> {uploaded_file.name}<br>
+                                <b style="color: #0056b3;">✅ Chuẩn:</b> {new_name}
                             </div>
                             """, unsafe_allow_html=True)
                         with col_dl:
                             st.write("")
-                            uploaded_file.seek(0)
+                            # Nút tải lẻ (Lưu ý: Bấm cái này vẫn sẽ reload trang)
                             st.download_button(
-                                label="⬇️ TẢI VỀ",
-                                data=uploaded_file,
+                                label="⬇️ Tải lẻ",
+                                data=file_data,
                                 file_name=new_name,
                                 mime='application/pdf',
                                 key=f"dl_{i}",
-                                use_container_width=True
+                                help="Lưu ý: Bấm nút này trang sẽ tải lại."
                             )
+                
                 progress_bar.progress((i + 1) / len(uploaded_files))
             
-            st.success("🎉 Hoàn tất quá trình số hóa!")
+            # --- XỬ LÝ NÉN ZIP (GIẢI PHÁP TẢI TẤT CẢ) ---
+            if success_files:
+                st.markdown("---")
+                st.success("🎉 Xử lý hoàn tất! Bấm nút dưới để tải tất cả về một lần.")
+                
+                # Tạo file ZIP trong bộ nhớ
+                zip_buffer = io.BytesIO()
+                with zipfile.ZipFile(zip_buffer, "w") as zf:
+                    for name, data in success_files:
+                        zf.writestr(name, data)
+                
+                # Nút tải ZIP to đùng
+                st.download_button(
+                    label="📦 TẢI VỀ TẤT CẢ (ZIP) - KHÔNG BỊ RELOAD",
+                    data=zip_buffer.getvalue(),
+                    file_name="Ho_so_da_so_hoa.zip",
+                    mime="application/zip",
+                    type="primary",
+                    use_container_width=True
+                )
